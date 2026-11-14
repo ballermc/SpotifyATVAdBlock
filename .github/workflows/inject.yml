@@ -1,0 +1,88 @@
+name: Inject dylib into tvOS Spotify IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipa_path:
+        description: "Path to decrypted IPA in the repo"
+        default: "input/Spotify.ipa"
+      dylib_path:
+        description: "Path to dylib in the repo"
+        default: "input/SpotifyATVAdBlock.dylib"
+      ipa_url:
+        description: "Optional: direct URL to the IPA (overrides ipa_path; use if file >100MB)"
+        required: false
+      dylib_url:
+        description: "Optional: direct URL to the dylib (overrides dylib_path)"
+        required: false
+
+jobs:
+  inject:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Fetch inputs
+        env:
+          IPA_PATH: ${{ inputs.ipa_path }}
+          DYLIB_PATH: ${{ inputs.dylib_path }}
+          IPA_URL: ${{ inputs.ipa_url }}
+          DYLIB_URL: ${{ inputs.dylib_url }}
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          if [ -n "$IPA_URL" ]; then curl -fL "$IPA_URL" -o work/in.ipa; else cp "$IPA_PATH" work/in.ipa; fi
+          if [ -n "$DYLIB_URL" ]; then curl -fL "$DYLIB_URL" -o work/inject.dylib; else cp "$DYLIB_PATH" work/inject.dylib
+          fi
+          DYLIB_NAME="$(basename "${DYLIB_URL:-$DYLIB_PATH}")"
+          DYLIB_NAME="${DYLIB_NAME%%\?*}"
+          echo "DYLIB_NAME=$DYLIB_NAME" >> "$GITHUB_ENV"
+          file work/inject.dylib
+          lipo -info work/inject.dylib
+
+      - name: Build insert_dylib
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/Tyilo/insert_dylib.git /tmp/insert_dylib
+          clang -O2 -o /tmp/insert_dylib_bin /tmp/insert_dylib/insert_dylib/main.c
+
+      - name: Inject
+        run: |
+          set -euo pipefail
+          cd work
+          rm -rf ipa && mkdir ipa
+          unzip -q in.ipa -d ipa
+          APP="$(find ipa/Payload -maxdepth 1 -name '*.app' | head -n1)"
+          [ -n "$APP" ] || { echo "No .app in Payload"; exit 1; }
+          EXEC="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")"
+          echo "App: $APP  Binary: $EXEC"
+
+          # Sanity: binary must be unencrypted (cryptid 0)
+          if otool -l "$APP/$EXEC" | grep -A4 LC_ENCRYPTION_INFO | grep -q 'cryptid 1'; then
+            echo "::error::IPA is still FairPlay-encrypted. Use a decrypted IPA."; exit 1
+          fi
+
+          cp inject.dylib "$APP/$DYLIB_NAME"
+          /tmp/insert_dylib_bin --inplace --strip-codesig --all-yes \
+            "@executable_path/$DYLIB_NAME" "$APP/$EXEC"
+
+          # Old signatures are invalid now; remove so you can re-sign cleanly
+          rm -rf "$APP/_CodeSignature"
+
+          echo "Load commands after injection:"
+          otool -L "$APP/$EXEC" | grep -i "$DYLIB_NAME"
+
+          cd ipa
+          zip -qry ../Spotify_patched.ipa Payload
+          cd ..
+          ls -lh Spotify_patched.ipa
+
+      - name: Upload patched IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Spotify_patched_unsigned
+          path: work/Spotify_patched.ipa
+          if-no-files-found: error
